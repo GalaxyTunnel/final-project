@@ -1,6 +1,0 @@
-{
-  "name": "VLESS & Trojan Cloudflare Worker Hub",
-  "description": "Unified Dual Protocol (VLESS + Trojan) Cloudflare Worker with Port 80 & 443, Proxy IP Fallback, Multi-DoH DNS, and Configuration Dashboard.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
