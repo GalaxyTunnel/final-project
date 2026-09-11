@@ -1,10 +1,9 @@
-name = "vless-trojan-relay"
+name = "vless-relay"
 main = "worker.js"
-compatibility_date = "2024-04-20"
+compatibility_date = "2026-09-11"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
-WS_PATH = "/vless"
+# Optional: Proxy IP fallback to resolve Cloudflare 1000/1001 errors
 PROXYIP = "cdn-b100.xn--b6gac.eu.org"
 PROXY_LIST_URL = "https://gprox-galaxy.github.io/PROXYIP.txt"
-DNS_RESOLVER_URL = "https://cloudflare-dns.com/dns-query"
