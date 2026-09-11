@@ -1,0 +1,15 @@
+name = "vless-trojan-relay"
+main = "worker.js"
+compatibility_date = "2026-09-11"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+WS_PATH = "/vless"
+PROXYIP = "cdn-b100.xn--b6gac.eu.org"
+PROXY_LIST_URL = "https://gprox-galaxy.github.io/PROXYIP.txt"
+DNS_RESOLVER_URL = "https://cloudflare-dns.com/dns-query"
+# SUB_TOKEN = "your-custom-sub-secret" # Optional: Protect /sub subscription endpoint
+
+# Secrets (Add via 'wrangler secret put UUID' or Cloudflare Dashboard):
+# UUID = "your-uuid-here"
+# TROJAN_PASS = "your-trojan-password"
