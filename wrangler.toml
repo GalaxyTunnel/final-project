@@ -11,5 +11,5 @@ workers_dev = true
 # 🔑 Variables များ (Plain text အနေဖြင့် ထည့်လိုပါက)
 [vars]
 #UUID = ""   # သင့် UUID ထည့်ပါ
-WS_PATH = "/"                                    # သင့် WS Path (ဥပမာ / သို့မဟုတ် /your-secret-path)
-PROXYIP = "cdn-b100.xn--b6gac.eu.org"            # စိတ်ကြိုက် Clean Proxy IP
+WS_PATH = "galaxy-tunnel"                                    # သင့် WS Path (ဥပမာ / သို့မဟုတ် /your-secret-path)
+PROXYIP = "www.visa.com.sg"            # စိတ်ကြိုက် Clean Proxy IP
