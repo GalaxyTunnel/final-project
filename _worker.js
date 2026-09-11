@@ -1,723 +1,547 @@
-/**
- * EdgeTunnel VLESS Unified Core (Cloudflare Workers & Cloudflare Pages Dual-Mode)
- * All-in-one Single File: worker.js
- * 
- * Features:
- * - VLESS TCP over WebSocket
- * - UDP DNS over HTTPS (DoH) via Cloudflare 1.1.1.1
- * - Dynamic Proxy IP / Domain Pool auto-fetcher
- * - Multi-node Subscription link generator (/sub)
- * - Anti-detection Camouflage Mask Page (Edge Network Diagnostics)
- * - Cloudflare Workers (`export default`) & Cloudflare Pages (`export async function onRequest`) dual exports
- */
-
 import { connect } from "cloudflare:sockets";
 
-// ================= Configurations =================
-const DEFAULT_PATH = "/vless";
-const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// =========================================================================
+// 🌟 ALL-IN-ONE HYBRID CLOUDFLARE WORKER (VLESS + TROJAN + AdBlock)
+// =========================================================================
 
-// Static Clean IPs & Domains fallback pool
-const STATIC_PROXY_LIST = [
-  "cdn.xn--b6gac.eu.org",
-  "cdn-b100.xn--b6gac.eu.org",
-  "icook.hk",
-  "icook.tw",
-  "www.visasoutheasteurope.com",
-  "www.visa.com.sg"
+// 🔑 1. DEFAULT CONFIGURATION (Hardcoded Fallback - စိတ်ချစွာ ပြောင်းလဲနိုင်သည်)
+const DEFAULT_UUID = "d342d11e-d424-4583-b36e-524ab1f0afa4";
+const DEFAULT_WS_PATH = "/"; // လျှို့ဝှက်လမ်းကြောင်း ထားလိုပါက "/your-secret-path" ဟု ပြောင်းပါ
+
+// 🌐 2. BALANCED GLOBAL PROXY POOL (Fast Anycast CDNs)
+const GLOBAL_PROXY_POOL = [
+    "cdn.xn--b6gac.eu.org",
+    "cdn-all.xn--b6gac.eu.org",
+    "cdn-b100.xn--b6gac.eu.org",
+    "www.visa.com.sg",
+    "www.visa.com.hk",
+    "icook.hk",
+    "icook.tw",
+    "workers.cloudflare.com"
 ];
 
-let cachedProxyIPs = [];
-let lastFetchTime = 0;
+// 🛡️ 3. DoH DNS PROVIDERS (UDP Port 53 Failover)
+const DOH_PROVIDERS = [
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/dns-query",
+    "https://dns.quad9.net/dns-query"
+];
 
-function cleanPath(value) {
-  const path = String(value || DEFAULT_PATH).trim();
-  const normalized = `/${path.replace(/^\/+|\/+$/g, "")}`;
-  if (normalized === "/" || normalized.length > 128 || /[\r\n?#]/.test(normalized)) return DEFAULT_PATH;
-  return normalized;
+// 🚫 4. FAST O(1) AD & TELEMETRY BLOCK LIST
+const AD_DOMAINS = new Set([
+    "doubleclick.net", "googleadservices.com", "googlesyndication.com",
+    "adservice.google.com", "pagead2.googlesyndication.com", "adcolony.com",
+    "appsflyer.com", "unityads.unity3d.com", "vungle.com", "applovin.com",
+    "flurry.com", "adjust.com", "branch.io", "admob.com", "mopub.com",
+    "criteo.com", "taboola.com", "outbrain.com", "scorecardresearch.com",
+    "quantserve.com", "popads.net", "inmobi.com", "adroll.com",
+    "amazon-adsystem.com", "adsafeprotected.com", "moatads.com", "openx.net"
+]);
+
+function isAdDomain(domain) {
+    if (!domain) return false;
+    const lower = domain.toLowerCase().trim();
+    if (AD_DOMAINS.has(lower)) return true;
+    for (const suffix of AD_DOMAINS) {
+        if (lower.endsWith("." + suffix)) return true;
+    }
+    return /^(ad|ads|adservice|adserver|telemetry|track|tracker|analytics)\./i.test(lower);
 }
 
-function getConfig(env) {
-  const uuid = String(env?.UUID || "").trim().toLowerCase();
-  const isUuidValid = UUID_RE.test(uuid);
-  return { 
-    uuid,
-    isUuidValid,
-    path: cleanPath(env?.WS_PATH),
-    proxyUrl: env?.PROXY_URL || DEFAULT_PROXY_URL,
-    customProxy: env?.PROXY_IP || ""
-  };
+function isValidUUID(uuid) {
+    if (!uuid) return false;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uuid.trim());
 }
 
-async function getProxyIP(config) {
-  if (config.customProxy) return config.customProxy;
-  
-  const now = Date.now();
-  if (cachedProxyIPs.length === 0 || now - lastFetchTime > 30 * 60 * 1000) {
-    try {
-      const response = await fetch(config.proxyUrl, { cf: { cacheTtl: 1800 } });
-      if (response.ok) {
-        const text = await response.text();
-        const lines = text.split("\n")
-          .map(l => l.trim())
-          .filter(l => l && !l.startsWith("#") && !l.startsWith("//") && !l.endsWith(".tk") && !l.endsWith(".ml") && !l.endsWith(".ga"));
-        if (lines.length > 0) {
-          cachedProxyIPs = lines;
-          lastFetchTime = now;
+// ============================================
+// SHA224 (Trojan Protocol Hashing)
+// ============================================
+function sha224(str) {
+    function rightRotate(value, amount) {
+        return (value >>> amount) | (value << (32 - amount));
+    }
+    const mathPow = Math.pow;
+    const maxWord = mathPow(2, 32);
+    let result = '';
+    const words = [];
+    const asciiBitLength = str.length * 8;
+    let hash = [
+        0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939,
+        0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4
+    ];
+    const k = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ];
+    let s = str;
+    s += '\x80';
+    while (s.length % 64 - 56) s += '\x00';
+    for (let i = 0; i < s.length; i++) {
+        const j = s.charCodeAt(i);
+        if (j >> 8) return null;
+        words[i >> 2] |= j << ((3 - i) % 4) * 8;
+    }
+    words[words.length] = ((asciiBitLength / maxWord) | 0);
+    words[words.length] = (asciiBitLength);
+    for (let j = 0; j < words.length;) {
+        const w = words.slice(j, j += 16);
+        const oldHash = hash.slice(0);
+        for (let i = 0; i < 64; i++) {
+            if (i >= 16) {
+                const w15 = w[i - 15], w2 = w[i - 2];
+                w[i] = (
+                    w[i - 16] +
+                    (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3)) +
+                    w[i - 7] +
+                    (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))
+                ) | 0;
+            }
+            const a = hash[0], e = hash[4];
+            const temp1 = (
+                hash[7] +
+                (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)) +
+                ((e & hash[5]) ^ (~e & hash[6])) +
+                k[i] +
+                w[i]
+            );
+            const temp2 = (
+                (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)) +
+                ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]))
+            );
+            hash = [(temp1 + temp2) | 0].concat(hash);
+            hash[4] = (hash[4] + temp1) | 0;
+            hash.pop();
         }
-      }
-    } catch {
-      // Use fallback
+        for (let i = 0; i < 8; i++) {
+            hash[i] = (hash[i] + oldHash[i]) | 0;
+        }
     }
-  }
-
-  const pool = cachedProxyIPs.length > 0 ? cachedProxyIPs : STATIC_PROXY_LIST;
-  return pool[Math.floor(Math.random() * pool.length)];
-}
-
-function uuidFromBytes(bytes) {
-  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-function base64ToBytes(value) {
-  if (!value) return null;
-  try {
-    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-    const binary = atob(normalized);
-    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
-  } catch {
-    return null;
-  }
-}
-
-function readVlessHeader(input, expectedUuid) {
-  const data = input instanceof Uint8Array ? input : new Uint8Array(input);
-  if (data.length < 18) return null;
-
-  const version = data[0];
-  const receivedUuid = uuidFromBytes(data.subarray(1, 17));
-  if (receivedUuid !== expectedUuid) throw new Error("Invalid VLESS UUID");
-
-  const optionsLength = data[17];
-  const commandIndex = 18 + optionsLength;
-  if (data.length < commandIndex + 4) return null;
-
-  const command = data[commandIndex];
-  if (command !== 1 && command !== 2) {
-    throw new Error(`Unsupported VLESS command: ${command}`);
-  }
-
-  const port = (data[commandIndex + 1] << 8) | data[commandIndex + 2];
-  const addressType = data[commandIndex + 3];
-  let offset = commandIndex + 4;
-  let host;
-
-  if (addressType === 1) {
-    if (data.length < offset + 4) return null;
-    host = [...data.subarray(offset, offset + 4)].join(".");
-    offset += 4;
-  } else if (addressType === 2) {
-    if (data.length < offset + 1) return null;
-    const length = data[offset];
-    offset += 1;
-    if (data.length < offset + length) return null;
-    host = new TextDecoder().decode(data.subarray(offset, offset + length));
-    offset += length;
-  } else if (addressType === 3) {
-    if (data.length < offset + 16) return null;
-    const groups = [];
-    for (let i = 0; i < 8; i++) {
-      groups.push(((data[offset + i * 2] << 8) | data[offset + i * 2 + 1]).toString(16));
+    for (let i = 0; i < 7; i++) {
+        const hex = hash[i];
+        result += ((hex >> 28) & 0xf).toString(16) +
+            ((hex >> 24) & 0xf).toString(16) +
+            ((hex >> 20) & 0xf).toString(16) +
+            ((hex >> 16) & 0xf).toString(16) +
+            ((hex >> 12) & 0xf).toString(16) +
+            ((hex >> 8) & 0xf).toString(16) +
+            ((hex >> 4) & 0xf).toString(16) +
+            (hex & 0xf).toString(16);
     }
-    host = groups.join(":");
-    offset += 16;
-  } else {
-    throw new Error("Invalid VLESS address type");
-  }
-
-  if (!host || host.length > 253 || /[\r\n]/.test(host)) throw new Error("Invalid destination host");
-  return {
-    command,
-    host,
-    port,
-    payload: data.subarray(offset),
-    responseHeader: new Uint8Array([version, 0])
-  };
+    return result;
 }
 
-function isBlockedDestination(host) {
-  const value = String(host).toLowerCase().replace(/^\[|\]$/g, "");
-  if (value === "localhost" || value.endsWith(".localhost") || value === "local" || value.endsWith(".local")) return true;
-  if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(value)) return true;
-  const match = value.match(/^172\.(\d{1,3})\./);
-  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return true;
-  if (value === "::1" || value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:")) return true;
-  return false;
+// ============================================
+// MAIN WORKER FETCH HANDLER
+// ============================================
+export default {
+    async fetch(request, env = {}, ctx = {}) {
+        // 1. UUID & Trojan Pass Resolution (One-UUID-For-All)
+        const userID = (env.UUID || env.uuid || DEFAULT_UUID).trim().toLowerCase();
+        const trojanPass = env.TROJAN_PASS || env.trojan_pass || userID; // UUID တစ်ခုတည်းဖြင့် Trojan ပါ အလိုအလျောက် သုံးနိုင်သည်
+        
+        // 2. Secret WS Path
+        const rawSecretPath = env.WS_PATH || env.ws_path || DEFAULT_WS_PATH;
+        const expectedSecretPath = rawSecretPath.startsWith("/") ? rawSecretPath : "/" + rawSecretPath;
+
+        // 3. User Requested Proxy IP Override
+        const customProxy = env.PROXYIP || env.proxyip || null;
+
+        const url = new URL(request.url);
+        const pathname = url.pathname;
+        const upgradeHeader = request.headers.get("Upgrade");
+
+        // 4. WebSocket Proxy Request (Works for TLS Port 443 AND Non-TLS Port 80!)
+        if (upgradeHeader === "websocket") {
+            // Secret Path Protection: Scanner probing ကာကွယ်ခြင်း
+            if (expectedSecretPath !== "/" && pathname !== expectedSecretPath) {
+                return new Response("Not Found", { status: 404 });
+            }
+            return await handleProxyWS(request, userID, trojanPass, customProxy);
+        }
+
+        // 5. Diagnostics API
+        if (pathname === "/api/health" || pathname === "/api/ping") {
+            return new Response(JSON.stringify({
+                status: "operational",
+                colo: request.cf?.colo || "EDGE-GLOBAL",
+                ip: request.headers.get("CF-Connecting-IP") || "127.0.0.1",
+                time: Date.now()
+            }), {
+                status: 200,
+                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+            });
+        }
+
+        // 6. Camouflage Mask Page (Corporate Latency Diagnostics - Zero Leaks)
+        const host = request.headers.get("Host") || url.host;
+        const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+        const colo = request.cf?.colo || "EDGE-GLOBAL";
+        return new Response(getCamouflagePage(host, clientIp, colo), {
+            status: 200,
+            headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+    }
+};
+
+// ============================================
+// DUAL-PROTOCOL WEBSOCKET PROXY HANDLER
+// ============================================
+async function handleProxyWS(request, validUUID, trojanPassword, customProxy) {
+    const webSocketPair = new WebSocketPair();
+    const [client, webSocket] = Object.values(webSocketPair);
+    webSocket.accept();
+
+    // 🟢 35-Second Keep-Alive Heartbeat (Mobile Data Idle Timeout Prevention)
+    const keepAlive = setInterval(() => {
+        if (webSocket.readyState === 1) {
+            try { webSocket.send(new Uint8Array(0)); } catch (e) { clearInterval(keepAlive); }
+        } else {
+            clearInterval(keepAlive);
+        }
+    }, 35000);
+
+    webSocket.addEventListener("close", () => clearInterval(keepAlive));
+    webSocket.addEventListener("error", () => clearInterval(keepAlive));
+
+    const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
+    const readableStream = makeReadableWSStream(webSocket, earlyDataHeader);
+
+    let remoteSocketWrapper = { value: null };
+    let udpStreamWrite = null;
+    let isDns = false;
+
+    readableStream.pipeTo(new WritableStream({
+        async write(chunk) {
+            if (isDns && udpStreamWrite) return udpStreamWrite(chunk);
+            if (remoteSocketWrapper.value) {
+                const writer = remoteSocketWrapper.value.writable.getWriter();
+                await writer.write(chunk);
+                writer.releaseLock();
+                return;
+            }
+
+            const firstByte = new Uint8Array(chunk.slice(0, 1))[0];
+            let result = null;
+
+            // 1. Try VLESS (First Byte == 0x00)
+            if (firstByte === 0x00) {
+                try {
+                    result = processVlessHeader(chunk, validUUID);
+                } catch (e) {
+                    result = { hasError: true, message: e.message };
+                }
+            }
+
+            // 2. Fallback to TROJAN
+            if ((!result || result.hasError) && trojanPassword) {
+                result = processTrojanHeader(chunk, trojanPassword);
+            }
+
+            if (!result || result.hasError) {
+                throw new Error(result ? result.message : "Authentication Failed");
+            }
+
+            const { addressRemote = "", portRemote = 443, rawDataIndex, responseHeader, isUDP } = result;
+
+            // 🛡️ AD & TRACKER BLOCK CHECK
+            if (isAdDomain(addressRemote)) {
+                safeCloseWS(webSocket);
+                return;
+            }
+
+            if (isUDP && portRemote === 53) isDns = true;
+
+            const rawClientData = chunk.slice(rawDataIndex);
+
+            if (isDns) {
+                const { write } = await handleUDPOutBound(webSocket, responseHeader);
+                udpStreamWrite = write;
+                udpStreamWrite(rawClientData);
+                return;
+            }
+
+            // TCP Outbound Connection
+            handleTCPOutbound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, webSocket, responseHeader, customProxy);
+        },
+        close() { safeCloseWS(webSocket); },
+        abort() { safeCloseWS(webSocket); }
+    })).catch(() => safeCloseWS(webSocket));
+
+    return new Response(null, { status: 101, webSocket: client });
 }
 
-function closeSocket(socket) {
-  try { socket?.close(); } catch { /* no-op */ }
-}
-
-function closeClient(socket) {
-  try { if (socket && socket.readyState < 2) socket.close(1011, "tunnel closed"); } catch { /* no-op */ }
-}
-
-async function handleUdpDns(client, parsed) {
-  client.send(parsed.responseHeader);
-
-  async function processDnsPacket(rawChunk) {
-    let raw = rawChunk instanceof Uint8Array ? rawChunk : new Uint8Array(rawChunk);
-    let dnsQuery = raw;
-    if (raw.length > 2) {
-      const declaredLen = (raw[0] << 8) | raw[1];
-      if (declaredLen <= raw.length - 2) {
-        dnsQuery = raw.subarray(2, 2 + declaredLen);
-      }
+// ============================================
+// TCP OUTBOUND WITH SMART PROXY FALLBACK
+// ============================================
+async function handleTCPOutbound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, customProxy) {
+    async function connectAndWrite(targetHost, targetPort) {
+        const tcpSocket = connect({ hostname: targetHost, port: targetPort });
+        remoteSocket.value = tcpSocket;
+        const writer = tcpSocket.writable.getWriter();
+        await writer.write(rawClientData);
+        writer.releaseLock();
+        return tcpSocket;
     }
 
-    const resp = await fetch("https://1.1.1.1/dns-query", {
-      method: "POST",
-      headers: { "content-type": "application/dns-message" },
-      body: dnsQuery,
+    async function retryWithProxy() {
+        // Select clean proxy IP: custom override first, or pick from balanced global pool
+        const selectedProxy = customProxy || GLOBAL_PROXY_POOL[Math.floor(Math.random() * GLOBAL_PROXY_POOL.length)];
+        try {
+            const fallbackSocket = await connectAndWrite(selectedProxy, portRemote);
+            fallbackSocket.closed.catch(() => safeCloseWS(webSocket));
+            pipeRemoteToWS(fallbackSocket, webSocket, null, null);
+        } catch (e) {
+            safeCloseWS(webSocket);
+        }
+    }
+
+    try {
+        const directSocket = await connectAndWrite(addressRemote, portRemote);
+        pipeRemoteToWS(directSocket, webSocket, responseHeader, retryWithProxy);
+    } catch (err) {
+        await retryWithProxy();
+    }
+}
+
+// ============================================
+// REMOTE TO WEBSOCKET PIPE
+// ============================================
+async function pipeRemoteToWS(remoteSocket, webSocket, responseHeader, retry) {
+    let header = responseHeader;
+    let hasData = false;
+
+    await remoteSocket.readable.pipeTo(new WritableStream({
+        async write(chunk, controller) {
+            hasData = true;
+            if (webSocket.readyState !== 1) controller.error("WS closed");
+            if (header && header.byteLength > 0) {
+                webSocket.send(await new Blob([header, chunk]).arrayBuffer());
+                header = null;
+            } else {
+                webSocket.send(chunk);
+            }
+        }
+    })).catch(() => safeCloseWS(webSocket));
+
+    if (!hasData && retry) retry();
+}
+
+// ============================================
+// PROTOCOL PARSERS (VLESS & TROJAN)
+// ============================================
+function processVlessHeader(vlessBuffer, validUUID) {
+    if (vlessBuffer.byteLength < 24) return { hasError: true, message: "Too short" };
+    const version = new Uint8Array(vlessBuffer.slice(0, 1));
+    const slicedUUID = unsafeStringify(new Uint8Array(vlessBuffer.slice(1, 17)));
+
+    if (slicedUUID !== validUUID.toLowerCase()) {
+        return { hasError: true, message: "Invalid UUID" };
+    }
+
+    const optLen = new Uint8Array(vlessBuffer.slice(17, 18))[0];
+    const command = new Uint8Array(vlessBuffer.slice(18 + optLen, 19 + optLen))[0];
+    const isUDP = command === 2;
+
+    const portIndex = 19 + optLen;
+    const portRemote = new DataView(vlessBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+
+    const addrIndex = portIndex + 2;
+    const addrType = new Uint8Array(vlessBuffer.slice(addrIndex, addrIndex + 1))[0];
+    let addrLen = 0, valIndex = addrIndex + 1, addressRemote = "";
+
+    if (addrType === 1) { // IPv4
+        addrLen = 4;
+        addressRemote = new Uint8Array(vlessBuffer.slice(valIndex, valIndex + addrLen)).join(".");
+    } else if (addrType === 2) { // Domain
+        addrLen = new Uint8Array(vlessBuffer.slice(valIndex, valIndex + 1))[0];
+        valIndex += 1;
+        addressRemote = new TextDecoder().decode(vlessBuffer.slice(valIndex, valIndex + addrLen));
+    } else if (addrType === 3) { // IPv6
+        addrLen = 16;
+        const view = new DataView(vlessBuffer.slice(valIndex, valIndex + addrLen));
+        const parts = [];
+        for (let i = 0; i < 8; i++) parts.push(view.getUint16(i * 2).toString(16));
+        addressRemote = parts.join(":");
+    }
+
+    return {
+        hasError: false,
+        addressRemote,
+        portRemote,
+        rawDataIndex: valIndex + addrLen,
+        responseHeader: new Uint8Array([version[0], 0]),
+        isUDP
+    };
+}
+
+function processTrojanHeader(trojanBuffer, password) {
+    if (trojanBuffer.byteLength < 58) return { hasError: true, message: "Trojan short" };
+    const bytes = new Uint8Array(trojanBuffer);
+    if (bytes[56] !== 0x0d || bytes[57] !== 0x0a) return { hasError: true, message: "Missing CRLF" };
+
+    const receivedHash = new TextDecoder().decode(bytes.slice(0, 56));
+    if (receivedHash !== sha224(password)) return { hasError: true, message: "Wrong Trojan pass" };
+
+    const command = bytes[58];
+    const addrType = bytes[59];
+    let addressRemote = "", addrLen = 0, valIndex = 60;
+    const view = new DataView(trojanBuffer);
+
+    if (addrType === 0x01) {
+        addrLen = 4;
+        addressRemote = Array.from(bytes.slice(valIndex, valIndex + addrLen)).join(".");
+    } else if (addrType === 0x03) {
+        addrLen = bytes[60]; valIndex = 61;
+        addressRemote = new TextDecoder().decode(bytes.slice(valIndex, valIndex + addrLen));
+    } else if (addrType === 0x04) {
+        addrLen = 16;
+        addressRemote = Array.from({ length: 8 }, (_, i) => view.getUint16(valIndex + i * 2).toString(16)).join(":");
+    }
+
+    const portIndex = valIndex + addrLen;
+    const portRemote = view.getUint16(portIndex);
+    const crlf = portIndex + 2;
+
+    return {
+        hasError: false,
+        addressRemote,
+        portRemote,
+        rawDataIndex: crlf + 2,
+        responseHeader: new Uint8Array(0),
+        isUDP: command === 0x03
+    };
+}
+
+// ============================================
+// UDP DoH HANDLER
+// ============================================
+async function handleUDPOutBound(webSocket, responseHeader) {
+    let isHeaderSent = false;
+    const transformStream = new TransformStream({
+        transform(chunk, controller) {
+            for (let i = 0; i < chunk.byteLength; ) {
+                const len = new DataView(chunk.slice(i, i + 2)).getUint16(0);
+                controller.enqueue(new Uint8Array(chunk.slice(i + 2, i + 2 + len)));
+                i += 2 + len;
+            }
+        }
     });
 
-    if (resp.ok) {
-      const dnsResponse = new Uint8Array(await resp.arrayBuffer());
-      const responsePacket = new Uint8Array(2 + dnsResponse.length);
-      responsePacket[0] = (dnsResponse.length >> 8) & 0xff;
-      responsePacket[1] = dnsResponse.length & 0xff;
-      responsePacket.set(dnsResponse, 2);
-      if (client.readyState === 1) client.send(responsePacket);
-    }
-  }
+    transformStream.readable.pipeTo(new WritableStream({
+        async write(chunk) {
+            for (const url of DOH_PROVIDERS) {
+                try {
+                    const resp = await fetch(url, {
+                        method: "POST",
+                        headers: { "content-type": "application/dns-message" },
+                        body: chunk
+                    });
+                    const dnsResult = await resp.arrayBuffer();
+                    const size = dnsResult.byteLength;
+                    const sizeBuf = new Uint8Array([size >> 8 & 255, size & 255]);
 
-  if (parsed.payload && parsed.payload.length > 0) {
-    await processDnsPacket(parsed.payload);
-  }
+                    if (webSocket.readyState === 1) {
+                        if (isHeaderSent) {
+                            webSocket.send(await new Blob([sizeBuf, dnsResult]).arrayBuffer());
+                        } else {
+                            webSocket.send(await new Blob([responseHeader, sizeBuf, dnsResult]).arrayBuffer());
+                            isHeaderSent = true;
+                        }
+                        return;
+                    }
+                } catch (e) { /* failover to next provider */ }
+            }
+        }
+    })).catch(() => {});
 
-  return {
-    write: processDnsPacket,
-    close: () => closeClient(client)
-  };
-}
-
-function makeSocketReadable(socket, client, responseHeader) {
-  let header = responseHeader;
-  return socket.readable.pipeTo(new WritableStream({
-    write(chunk) {
-      if (client.readyState !== 1) throw new Error("WebSocket is closed");
-      const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-      if (header) {
-        const output = new Uint8Array(header.length + bytes.length);
-        output.set(header);
-        output.set(bytes, header.length);
-        client.send(output);
-        header = null;
-      } else {
-        client.send(bytes);
-      }
-    }
-  })).catch(() => closeClient(client));
-}
-
-async function startTcpTunnel(client, parsed, config) {
-  let socket;
-  try {
-    socket = connect({ hostname: parsed.host, port: parsed.port });
-    await socket.opened;
-  } catch {
-    const proxy = await getProxyIP(config);
-    const [proxyHost, proxyPort] = proxy.split(":");
-    socket = connect({ hostname: proxyHost, port: Number(proxyPort) || parsed.port });
-  }
-
-  socket.closed.catch(() => closeClient(client)).finally(() => closeClient(client));
-  const writer = socket.writable.getWriter();
-  await writer.write(parsed.payload);
-  writer.releaseLock();
-
-  makeSocketReadable(socket, client, parsed.responseHeader);
-  return socket;
-}
-
-function openWebSocket(request, config) {
-  const pair = new WebSocketPair();
-  const client = pair[0];
-  const server = pair[1];
-  server.accept();
-
-  let socket = null;
-  let udpHandler = null;
-  let buffer = new Uint8Array(0);
-  let connected = false;
-  const earlyData = base64ToBytes(request.headers.get("Sec-WebSocket-Protocol"));
-
-  const consume = async (chunk) => {
-    const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
-    
-    if (connected) {
-      if (udpHandler) {
-        await udpHandler.write(bytes);
-      } else if (socket) {
-        const writer = socket.writable.getWriter();
-        try { await writer.write(bytes); } finally { writer.releaseLock(); }
-      }
-      return;
-    }
-
-    const combined = new Uint8Array(buffer.length + bytes.length);
-    combined.set(buffer);
-    combined.set(bytes, buffer.length);
-    buffer = combined;
-
-    const parsed = readVlessHeader(buffer, config.uuid);
-    if (!parsed) return;
-    if (isBlockedDestination(parsed.host)) throw new Error("Blocked destination");
-    
-    connected = true;
-
-    if (parsed.command === 2) {
-      udpHandler = await handleUdpDns(server, parsed);
-    } else {
-      socket = await startTcpTunnel(server, parsed, config);
-    }
-  };
-
-  server.addEventListener("message", (event) => consume(event.data).catch(() => closeClient(server)));
-  server.addEventListener("close", () => { closeSocket(socket); udpHandler?.close(); });
-  server.addEventListener("error", () => { closeSocket(socket); udpHandler?.close(); });
-  
-  if (earlyData) consume(earlyData).catch(() => closeClient(server));
-
-  return new Response(null, { status: 101, webSocket: client });
-}
-
-function encodeBase64(text) {
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
-}
-
-function makeLinks(request, config) {
-  const url = new URL(request.url);
-  const host = url.host;
-  const path = encodeURIComponent(`${config.path}?ed=2048`);
-
-  const nodes = [
-    { name: `VLESS TLS (${host})`, address: host, port: 443, tls: true },
-    { name: `VLESS Clean (icook.hk)`, address: "icook.hk", port: 443, tls: true },
-    { name: `VLESS Clean (Visa)`, address: "www.visasoutheasteurope.com", port: 443, tls: true },
-    { name: `VLESS Clean (cdn.eu.org)`, address: "cdn.xn--b6gac.eu.org", port: 443, tls: true },
-    { name: `VLESS NoTLS (${host})`, address: host, port: 80, tls: false }
-  ];
-
-  const links = nodes.map(n => {
-    const sec = n.tls ? "security=tls&sni=" + host : "security=none";
-    return `vless://${config.uuid}@${n.address}:${n.port}?encryption=none&${sec}&type=ws&host=${host}&path=${path}#${encodeURIComponent(n.name)}`;
-  }).join("\n");
-
-  return { base64: encodeBase64(links) };
+    const writer = transformStream.writable.getWriter();
+    return { write: (c) => writer.write(c) };
 }
 
 // ============================================
-// ELEGANT CAMOUFLAGE MASK PAGE (Edge Diagnostics)
+// UTILITIES
 // ============================================
-export function getMaskPage(host = "localhost", isUuidConfigured = true, clientIp = "127.0.0.1", colo = "EDGE-GLOBAL") {
-  return `<!DOCTYPE html>
+function makeReadableWSStream(webSocket, earlyDataHeader) {
+    return new ReadableStream({
+        start(controller) {
+            webSocket.addEventListener("message", (e) => controller.enqueue(e.data));
+            webSocket.addEventListener("close", () => controller.close());
+            webSocket.addEventListener("error", (e) => controller.error(e));
+            if (earlyDataHeader) {
+                try {
+                    const dec = atob(earlyDataHeader.replace(/-/g, "+").replace(/_/g, "/"));
+                    controller.enqueue(Uint8Array.from(dec, c => c.charCodeAt(0)).buffer);
+                } catch (e) {}
+            }
+        },
+        cancel() { safeCloseWS(webSocket); }
+    });
+}
+
+function safeCloseWS(ws) {
+    try { if (ws && (ws.readyState === 1 || ws.readyState === 2)) ws.close(); } catch(e) {}
+}
+
+const byteToHex = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
+function unsafeStringify(arr, offset = 0) {
+    return (byteToHex[arr[offset]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + "-" +
+        byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + "-" +
+        byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + "-" +
+        byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + "-" +
+        byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase();
+}
+
+// ============================================
+// CAMOUFLAGE MASK PAGE (Edge Diagnostics)
+// ============================================
+function getCamouflagePage(host, clientIp, colo) {
+    return `<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge Gateway | Cloud Diagnostics &amp; Latency Monitor</title>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edge Network Gateway | Latency & Health Diagnostics</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      background: #f8fafc;
-      color: #0f172a;
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    header {
-      background: #ffffff;
-      border-bottom: 1px solid #e2e8f0;
-      padding: 14px 24px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      position: sticky;
-      top: 0;
-      z-index: 50;
-    }
-    .logo-area {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-weight: 800;
-      font-size: 16px;
-      color: #0f172a;
-    }
-    .logo-icon {
-      width: 32px;
-      height: 32px;
-      background: #0f172a;
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: #ffffff;
-      font-weight: 900;
-      font-size: 15px;
-    }
-    .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      background: ${isUuidConfigured ? '#0f172a' : '#991b1b'};
-      padding: 6px 14px;
-      border-radius: 9999px;
-      font-size: 11px;
-      font-weight: 700;
-      color: #ffffff;
-    }
-    .status-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: ${isUuidConfigured ? '#22c55e' : '#fca5a5'};
-      box-shadow: 0 0 8px ${isUuidConfigured ? '#22c55e' : '#f87171'};
-    }
-    main {
-      flex: 1;
-      max-width: 920px;
-      width: 100%;
-      margin: 0 auto;
-      padding: 32px 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-    .hero-card {
-      background: linear-gradient(180deg, #f0fdf4 0%, #ffffff 40%);
-      border: 1px solid #e2e8f0;
-      border-radius: 16px;
-      padding: 28px 24px;
-      box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.03);
-      position: relative;
-    }
-    .hero-top-badge {
-      position: absolute;
-      top: 24px;
-      right: 24px;
-      background: #dcfce7;
-      border: 1px solid #bbf7d0;
-      color: #166534;
-      font-size: 12px;
-      font-weight: 700;
-      padding: 4px 12px;
-      border-radius: 9999px;
-    }
-    .hero-title {
-      font-size: 22px;
-      font-weight: 800;
-      color: #0f172a;
-      margin-bottom: 8px;
-    }
-    .hero-desc {
-      color: #475569;
-      font-size: 14px;
-      line-height: 1.6;
-      max-width: 680px;
-      margin-bottom: 20px;
-    }
-    .btn-run {
-      background: #0f172a;
-      color: #ffffff;
-      border: none;
-      padding: 9px 18px;
-      border-radius: 8px;
-      font-weight: 700;
-      font-size: 13px;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .bench-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 12px;
-      margin-top: 20px;
-    }
-    .bench-box {
-      border-radius: 12px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-    }
-    .bench-box-1 { background: #ecfdf5; border: 1px solid #a7f3d0; }
-    .bench-box-2 { background: #f0fdf4; border: 1px solid #bbf7d0; }
-    .bench-box-3 { background: #eef2ff; border: 1px solid #c7d2fe; }
-    .bench-box-4 { background: #faf5ff; border: 1px solid #e9d5ff; }
-    .bench-label {
-      font-size: 11px;
-      font-weight: 700;
-      text-transform: uppercase;
-      color: #475569;
-    }
-    .bench-val {
-      font-size: 24px;
-      font-weight: 800;
-      color: #0f172a;
-      margin-top: 4px;
-      font-family: monospace;
-    }
-    .bench-meta {
-      font-size: 12px;
-      font-weight: 600;
-      margin-top: 2px;
-      color: #16a34a;
-    }
-    .grid-2 {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 16px;
-    }
-    @media (min-width: 768px) {
-      .grid-2 { grid-template-columns: 1fr 1fr; }
-    }
-    .card {
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 14px;
-      padding: 20px;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
-    }
-    .card-heading {
-      font-size: 14px;
-      font-weight: 800;
-      color: #0f172a;
-      margin-bottom: 14px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .info-row {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 9px 0;
-      border-bottom: 1px solid #f1f5f9;
-      font-size: 13px;
-    }
-    .info-row:last-child { border-bottom: none; }
-    .info-k { color: #64748b; font-weight: 500; }
-    .info-v { color: #0f172a; font-family: monospace; font-weight: 700; }
-    footer {
-      background: #ffffff;
-      border-top: 1px solid #e2e8f0;
-      padding: 16px;
-      text-align: center;
-      font-size: 12px;
-      color: #64748b;
-    }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0b0f17; color: #e2e8f0; margin: 0; padding: 24px; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
+    .card { background: #131b2e; border: 1px solid #1e293b; border-radius: 16px; padding: 32px; max-width: 540px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; background: rgba(34,197,94,0.15); color: #4ade80; padding: 4px 12px; border-radius: 999px; font-size: 11px; font-weight: 700; border: 1px solid rgba(34,197,94,0.3); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+    h1 { font-size: 20px; font-weight: 800; margin: 16px 0 8px 0; color: #ffffff; }
+    p { font-size: 13px; color: #94a3b8; line-height: 1.5; margin: 0 0 20px 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+    .box { background: #0f172a; padding: 12px 14px; border-radius: 10px; border: 1px solid #1e293b; }
+    .label { font-size: 11px; color: #64748b; font-weight: 600; text-transform: uppercase; }
+    .val { font-size: 14px; font-weight: 700; color: #f8fafc; font-family: monospace; margin-top: 4px; }
+    .btn { width: 100%; background: #2563eb; color: #fff; border: none; padding: 10px; border-radius: 8px; font-weight: 700; font-size: 13px; cursor: pointer; transition: opacity 0.2s; }
+    .btn:hover { opacity: 0.9; }
   </style>
 </head>
 <body>
-  <header>
-    <div class="logo-area">
-      <div class="logo-icon">⚡</div>
-      <span>EdgeTunnel Cloud</span>
+  <div class="card">
+    <div class="badge"><span class="dot"></span> EDGE OPERATIONAL</div>
+    <h1>Cloud Network Edge Gateway</h1>
+    <p>Real-time edge cluster connectivity and Anycast latency telemetry active.</p>
+    <div class="grid">
+      <div class="box"><div class="label">POP Region</div><div class="val">${colo}</div></div>
+      <div class="box"><div class="label">Roundtrip Ping</div><div class="val" id="p">-- ms</div></div>
+      <div class="box"><div class="label">Protocol</div><div class="val">HTTP/2 & HTTP/3</div></div>
+      <div class="box"><div class="label">Client IP</div><div class="val">${clientIp}</div></div>
     </div>
-    <div class="status-pill">
-      <span class="status-dot"></span>
-      <span>${isUuidConfigured ? 'EDGE OPERATIONAL' : 'CONFIGURATION REQUIRED'}</span>
-    </div>
-  </header>
-
-  <main>
-    <div class="hero-card">
-      <div class="hero-top-badge">${isUuidConfigured ? 'Ready' : 'Standby'}</div>
-      <h1 class="hero-title">Edge Network Diagnostics &amp; Telemetry</h1>
-      <p class="hero-desc">Real-time edge server telemetry, DNS-over-HTTPS status verification, and full-duplex socket connectivity diagnostics for cloud edge clusters.</p>
-      
-      <button class="btn-run" id="btnBench" onclick="runDiagnostics()">
-        ⚡ Re-Run Benchmark
-      </button>
-
-      <div class="bench-grid">
-        <div class="bench-box bench-box-1">
-          <div class="bench-label">Roundtrip Ping</div>
-          <div class="bench-val" id="pingVal">-- ms</div>
-          <div class="bench-meta" id="pingStatus">Measuring...</div>
-        </div>
-        <div class="bench-box bench-box-2">
-          <div class="bench-label">DNS-Over-HTTPS</div>
-          <div class="bench-val">Active</div>
-          <div class="bench-meta">Cloudflare 1.1.1.1</div>
-        </div>
-        <div class="bench-box bench-box-3">
-          <div class="bench-label">WebSocket Engine</div>
-          <div class="bench-val">Optimized</div>
-          <div class="bench-meta">RFC 6455 Fast WS</div>
-        </div>
-        <div class="bench-box bench-box-4">
-          <div class="bench-label">Edge Cluster Location</div>
-          <div class="bench-val">${colo}</div>
-          <div class="bench-meta">Anycast Network</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="card">
-        <div class="card-heading">🌐 Connection Telemetry</div>
-        <div class="info-row">
-          <span class="info-k">Client Remote IP:</span>
-          <span class="info-v">${clientIp}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-k">Serving Host (SNI):</span>
-          <span class="info-v">${host}</span>
-        </div>
-        <div class="info-row">
-          <span class="info-k">HTTP Protocol:</span>
-          <span class="info-v">HTTP/2 &amp; HTTP/3 (QUIC)</span>
-        </div>
-        <div class="info-row">
-          <span class="info-k">Encryption &amp; Cipher:</span>
-          <span class="info-v">TLS 1.3 / AEAD ChaCha20</span>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="card-heading">🛡️ Edge Security &amp; Health</div>
-        <div class="info-row">
-          <span class="info-k">Security Layer:</span>
-          <span class="info-v" style="color: #16a34a;">Active</span>
-        </div>
-        <div class="info-row">
-          <span class="info-k">Global Edge Cache:</span>
-          <span class="info-v">100% Operational</span>
-        </div>
-        <div class="info-row">
-          <span class="info-k">Service Status:</span>
-          <span class="info-v" style="color: #16a34a;">Optimal (99.99%)</span>
-        </div>
-      </div>
-    </div>
-  </main>
-
-  <footer>
-    EdgeTunnel Cloud Network • High Availability Edge Gateway • All Systems Running
-  </footer>
-
+    <button class="btn" onclick="t()">⚡ Test Latency</button>
+  </div>
   <script>
-    async function runDiagnostics() {
-      const btn = document.getElementById('btnBench');
-      const pingVal = document.getElementById('pingVal');
-      const pingStatus = document.getElementById('pingStatus');
-
-      btn.disabled = true;
-      btn.textContent = "Testing...";
-      pingVal.textContent = "...";
-
-      const pings = [];
-      for (let i = 0; i < 3; i++) {
-        const start = performance.now();
-        try {
-          await fetch('/healthz?t=' + Date.now(), { cache: 'no-store' });
-          pings.push(Math.round(performance.now() - start));
-        } catch (e) {
-          pings.push(24);
-        }
-        await new Promise(r => setTimeout(r, 100));
-      }
-
-      const avg = Math.round(pings.reduce((a, b) => a + b, 0) / pings.length);
-      pingVal.textContent = avg + ' ms';
-      pingStatus.textContent = "Optimal Latency";
-      btn.disabled = false;
-      btn.textContent = "⚡ Re-Run Benchmark";
+    async function t() {
+      const s = performance.now();
+      try { await fetch('/api/health?t=' + Date.now()); const d = Math.round(performance.now() - s); document.getElementById('p').textContent = d + ' ms'; }
+      catch(e) { document.getElementById('p').textContent = '22 ms'; }
     }
-
-    setTimeout(runDiagnostics, 400);
+    setTimeout(t, 200);
   </script>
 </body>
 </html>`;
-}
-
-// ================= Unified Handler =================
-async function handleRequest(request, env, ctx) {
-  const config = getConfig(env);
-  const url = new URL(request.url);
-  const upgrade = request.headers.get("Upgrade");
-
-  // 1. WebSocket VLESS Tunnel
-  if (upgrade && upgrade.toLowerCase() === "websocket") {
-    if (!config.isUuidValid) {
-      return new Response("Unauthorized: Missing or invalid UUID configuration", { status: 401 });
-    }
-    if (url.pathname !== config.path) {
-      return new Response("Not found", { status: 404 });
-    }
-    return openWebSocket(request, config);
-  }
-
-  // 2. Subscription Link (/sub)
-  if (url.pathname === "/sub") {
-    if (!config.isUuidValid) {
-      return new Response("UUID not set in environment", { status: 400 });
-    }
-    const links = makeLinks(request, config);
-    return new Response(links.base64, {
-      headers: {
-        "content-type": "text/plain; charset=utf-8",
-        "access-control-allow-origin": "*",
-        "profile-update-interval": "12"
       }
-    });
-  }
-
-  // 3. Health Check
-  if (url.pathname === "/healthz") {
-    return new Response("ok", { 
-      headers: { 
-        "cache-control": "no-store", 
-        "content-type": "text/plain" 
-      } 
-    });
-  }
-
-  // 4. Default: Camouflage Mask Page
-  const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
-  const colo = (request.cf && request.cf.colo) ? request.cf.colo : "EDGE-ANYCAST";
-  const html = getMaskPage(url.host, config.isUuidValid, clientIp, colo);
-
-  return new Response(html, {
-    status: 200,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store, max-age=0"
-    }
-  });
-}
-
-// Export 1: Standard Cloudflare Worker export
-const worker = {
-  fetch: handleRequest
-};
-export default worker;
-
-// Export 2: Cloudflare Pages Functions export (Single-file Pages compatibility)
-export async function onRequest(context) {
-  return handleRequest(context.request, context.env, context);
-}
-export const onRequestGet = onRequest;
-export const onRequestPost = onRequest;
