@@ -1,519 +1,723 @@
-// ==============================================================================
-// PURE VLESS CLOUDFLARE WORKER RELAY (CLEAN & MINIMAL)
-// - Protocol: 100% Pure VLESS (No Trojan conflicts)
-// - Ports: Port 80, 8080, 8880 (No-TLS) & Port 443, 8443 (TLS 1.3)
-// - Features: Hybrid Proxy IP Fallback (No 1000 Error) | Multi-DoH Race DNS
-// - Compatibility: v2rayNG, v2rayN, Shadowrocket, Sing-box, Clash Meta, Nekobox
-// ==============================================================================
+/**
+ * EdgeTunnel VLESS Unified Core (Cloudflare Workers & Cloudflare Pages Dual-Mode)
+ * All-in-one Single File: worker.js
+ * 
+ * Features:
+ * - VLESS TCP over WebSocket
+ * - UDP DNS over HTTPS (DoH) via Cloudflare 1.1.1.1
+ * - Dynamic Proxy IP / Domain Pool auto-fetcher
+ * - Multi-node Subscription link generator (/sub)
+ * - Anti-detection Camouflage Mask Page (Edge Network Diagnostics)
+ * - Cloudflare Workers (`export default`) & Cloudflare Pages (`export async function onRequest`) dual exports
+ */
 
 import { connect } from "cloudflare:sockets";
 
-// Default UUID (Can be overridden by Cloudflare Environment Variable 'UUID')
-const DEFAULT_UUID = "";
-const DEFAULT_PROXY_IP = "cdn-b100.xn--b6gac.eu.org";
-const DEFAULT_PROXY_URL = "https://gprox-galaxy.github.io/PROXYIP.txt";
+// ================= Configurations =================
+const DEFAULT_PATH = "/vless";
+const DEFAULT_PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-let cachedProxyList = [];
-let lastProxyFetchTime = 0;
-const PROXY_CACHE_TTL = 3600000; // 1 hour
-
-// ------------------------------------------------------------------------------
-// Helper: UUID Parsing & Comparison
-// ------------------------------------------------------------------------------
-function isValidUUID(uuid) {
-  const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  return re.test(uuid);
-}
-
-function stringToUUIDBytes(uuidStr) {
-  const clean = uuidStr.replace(/-/g, "");
-  const bytes = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) {
-    bytes[i] = parseInt(clean.substr(i * 2, 2), 16);
-  }
-  return bytes;
-}
-
-function compareBytes(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
-
-function base64ToArrayBuffer(base64Str) {
-  if (!base64Str) return { earlyData: null, error: null };
-  try {
-    const b64 = base64Str.replace(/-/g, "+").replace(/_/g, "/");
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return { earlyData: bytes.buffer, error: null };
-  } catch (err) {
-    return { earlyData: null, error: err };
-  }
-}
-
-function safeCloseWebSocket(ws) {
-  try {
-    if (ws.readyState === 1 || ws.readyState === 0) {
-      ws.close(1000, "Normal Closure");
-    }
-  } catch (_) {}
-}
-
-// ------------------------------------------------------------------------------
-// Hybrid Proxy IP Pool (Fixes Cloudflare 1000/1001 Direct Connection Loop Errors)
-// ------------------------------------------------------------------------------
-async function getHybridProxyIP(fallbackProxyIP, githubProxyURL) {
-  const now = Date.now();
-  if (cachedProxyList.length > 0 && now - lastProxyFetchTime < PROXY_CACHE_TTL) {
-    return cachedProxyList[Math.floor(Math.random() * cachedProxyList.length)];
-  }
-
-  const targetURL = githubProxyURL || DEFAULT_PROXY_URL;
-  try {
-    const res = await fetch(targetURL, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      cf: { cacheTtl: 3600 }
-    });
-    if (res.ok) {
-      const text = await res.text();
-      const list = text
-        .split(/[\r\n]+/)
-        .map((l) => l.trim())
-        .filter((l) => l && !l.startsWith("#") && (l.includes(".") || l.includes(":")));
-      if (list.length > 0) {
-        cachedProxyList = list;
-        lastProxyFetchTime = now;
-        return cachedProxyList[Math.floor(Math.random() * cachedProxyList.length)];
-      }
-    }
-  } catch (_) {}
-
-  return fallbackProxyIP || DEFAULT_PROXY_IP;
-}
-
-// ------------------------------------------------------------------------------
-// Multi-DoH DNS Pool (Fast UDP DNS Resolution via Promise.any Race)
-// ------------------------------------------------------------------------------
-const DOH_PROVIDERS = [
-  "https://cloudflare-dns.com/dns-query",
-  "https://dns.google/dns-query",
-  "https://dns.quad9.net/dns-query",
-  "https://doh.opendns.com/dns-query"
+// Static Clean IPs & Domains fallback pool
+const STATIC_PROXY_LIST = [
+  "cdn.xn--b6gac.eu.org",
+  "cdn-b100.xn--b6gac.eu.org",
+  "icook.hk",
+  "icook.tw",
+  "www.visasoutheasteurope.com",
+  "www.visa.com.sg"
 ];
 
-async function handleUDPOutBound(webSocketServer, responseHeader, client) {
-  let isHeaderSent = false;
+let cachedProxyIPs = [];
+let lastFetchTime = 0;
 
-  const transformStream = new TransformStream({
-    async transform(chunk, controller) {
-      let offset = 0;
-      while (offset < chunk.byteLength) {
-        if (offset + 2 > chunk.byteLength) break;
-        const length = (chunk[offset] << 8) | chunk[offset + 1];
-        offset += 2;
-        if (offset + length > chunk.byteLength) break;
-        const dnsQuery = chunk.slice(offset, offset + length);
-        offset += length;
+function cleanPath(value) {
+  const path = String(value || DEFAULT_PATH).trim();
+  const normalized = `/${path.replace(/^\/+|\/+$/g, "")}`;
+  if (normalized === "/" || normalized.length > 128 || /[\r\n?#]/.test(normalized)) return DEFAULT_PATH;
+  return normalized;
+}
 
-        try {
-          const fetchDOH = (url) =>
-            fetch(url, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/dns-message",
-                Accept: "application/dns-message"
-              },
-              body: dnsQuery
-            });
+function getConfig(env) {
+  const uuid = String(env?.UUID || "").trim().toLowerCase();
+  const isUuidValid = UUID_RE.test(uuid);
+  return { 
+    uuid,
+    isUuidValid,
+    path: cleanPath(env?.WS_PATH),
+    proxyUrl: env?.PROXY_URL || DEFAULT_PROXY_URL,
+    customProxy: env?.PROXY_IP || ""
+  };
+}
 
-          const res = await Promise.any(DOH_PROVIDERS.map((doh) => fetchDOH(doh)));
-          if (res.ok) {
-            const dnsResponse = await res.arrayBuffer();
-            const respBytes = new Uint8Array(dnsResponse);
-            const respLen = respBytes.length;
-            const packet = new Uint8Array(2 + respLen);
-            packet[0] = (respLen >> 8) & 0xff;
-            packet[1] = respLen & 0xff;
-            packet.set(respBytes, 2);
+async function getProxyIP(config) {
+  if (config.customProxy) return config.customProxy;
+  
+  const now = Date.now();
+  if (cachedProxyIPs.length === 0 || now - lastFetchTime > 30 * 60 * 1000) {
+    try {
+      const response = await fetch(config.proxyUrl, { cf: { cacheTtl: 1800 } });
+      if (response.ok) {
+        const text = await response.text();
+        const lines = text.split("\n")
+          .map(l => l.trim())
+          .filter(l => l && !l.startsWith("#") && !l.startsWith("//") && !l.endsWith(".tk") && !l.endsWith(".ml") && !l.endsWith(".ga"));
+        if (lines.length > 0) {
+          cachedProxyIPs = lines;
+          lastFetchTime = now;
+        }
+      }
+    } catch {
+      // Use fallback
+    }
+  }
 
-            if (!isHeaderSent) {
-              controller.enqueue(new Uint8Array([...responseHeader, ...packet]));
-              isHeaderSent = true;
-            } else {
-              controller.enqueue(packet);
-            }
-          }
-        } catch (_) {}
+  const pool = cachedProxyIPs.length > 0 ? cachedProxyIPs : STATIC_PROXY_LIST;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function uuidFromBytes(bytes) {
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function base64ToBytes(value) {
+  if (!value) return null;
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(normalized);
+    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+function readVlessHeader(input, expectedUuid) {
+  const data = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (data.length < 18) return null;
+
+  const version = data[0];
+  const receivedUuid = uuidFromBytes(data.subarray(1, 17));
+  if (receivedUuid !== expectedUuid) throw new Error("Invalid VLESS UUID");
+
+  const optionsLength = data[17];
+  const commandIndex = 18 + optionsLength;
+  if (data.length < commandIndex + 4) return null;
+
+  const command = data[commandIndex];
+  if (command !== 1 && command !== 2) {
+    throw new Error(`Unsupported VLESS command: ${command}`);
+  }
+
+  const port = (data[commandIndex + 1] << 8) | data[commandIndex + 2];
+  const addressType = data[commandIndex + 3];
+  let offset = commandIndex + 4;
+  let host;
+
+  if (addressType === 1) {
+    if (data.length < offset + 4) return null;
+    host = [...data.subarray(offset, offset + 4)].join(".");
+    offset += 4;
+  } else if (addressType === 2) {
+    if (data.length < offset + 1) return null;
+    const length = data[offset];
+    offset += 1;
+    if (data.length < offset + length) return null;
+    host = new TextDecoder().decode(data.subarray(offset, offset + length));
+    offset += length;
+  } else if (addressType === 3) {
+    if (data.length < offset + 16) return null;
+    const groups = [];
+    for (let i = 0; i < 8; i++) {
+      groups.push(((data[offset + i * 2] << 8) | data[offset + i * 2 + 1]).toString(16));
+    }
+    host = groups.join(":");
+    offset += 16;
+  } else {
+    throw new Error("Invalid VLESS address type");
+  }
+
+  if (!host || host.length > 253 || /[\r\n]/.test(host)) throw new Error("Invalid destination host");
+  return {
+    command,
+    host,
+    port,
+    payload: data.subarray(offset),
+    responseHeader: new Uint8Array([version, 0])
+  };
+}
+
+function isBlockedDestination(host) {
+  const value = String(host).toLowerCase().replace(/^\[|\]$/g, "");
+  if (value === "localhost" || value.endsWith(".localhost") || value === "local" || value.endsWith(".local")) return true;
+  if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(value)) return true;
+  const match = value.match(/^172\.(\d{1,3})\./);
+  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return true;
+  if (value === "::1" || value.startsWith("fc") || value.startsWith("fd") || value.startsWith("fe80:")) return true;
+  return false;
+}
+
+function closeSocket(socket) {
+  try { socket?.close(); } catch { /* no-op */ }
+}
+
+function closeClient(socket) {
+  try { if (socket && socket.readyState < 2) socket.close(1011, "tunnel closed"); } catch { /* no-op */ }
+}
+
+async function handleUdpDns(client, parsed) {
+  client.send(parsed.responseHeader);
+
+  async function processDnsPacket(rawChunk) {
+    let raw = rawChunk instanceof Uint8Array ? rawChunk : new Uint8Array(rawChunk);
+    let dnsQuery = raw;
+    if (raw.length > 2) {
+      const declaredLen = (raw[0] << 8) | raw[1];
+      if (declaredLen <= raw.length - 2) {
+        dnsQuery = raw.subarray(2, 2 + declaredLen);
       }
     }
-  });
 
-  transformStream.readable
-    .pipeTo(
-      new WritableStream({
-        write(chunk) {
-          if (client.readyState === 1) client.send(chunk);
-        },
-        close() {
-          safeCloseWebSocket(webSocketServer);
-        },
-        abort() {
-          safeCloseWebSocket(webSocketServer);
-        }
-      })
-    )
-    .catch(() => safeCloseWebSocket(webSocketServer));
-
-  return transformStream.writable;
-}
-
-// ------------------------------------------------------------------------------
-// TCP Outbound Relay with Fallback Proxy IP
-// ------------------------------------------------------------------------------
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, client, responseHeader, proxyIP, githubProxyURL) {
-  async function connectAndWrite(address, port) {
-    const tcpSocket = connect({ hostname: address, port });
-    remoteSocket.value = tcpSocket;
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
-    writer.releaseLock();
-    return tcpSocket;
-  }
-
-  async function retry() {
-    const activeProxy = await getHybridProxyIP(proxyIP, githubProxyURL);
-    const target = activeProxy || addressRemote;
-    try {
-      const fallbackSocket = await connectAndWrite(target, portRemote);
-      fallbackSocket.closed.catch(() => {}).finally(() => safeCloseWebSocket(client));
-      remoteSocketToClient(fallbackSocket, client, responseHeader, null);
-    } catch (_) {
-      safeCloseWebSocket(client);
-    }
-  }
-
-  try {
-    const primarySocket = await connectAndWrite(addressRemote, portRemote);
-    remoteSocketToClient(primarySocket, client, responseHeader, retry);
-  } catch (_) {
-    await retry();
-  }
-}
-
-async function remoteSocketToClient(remoteSocket, client, responseHeader, retry) {
-  let header = responseHeader;
-  let hasIncomingData = false;
-
-  await remoteSocket.readable
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          hasIncomingData = true;
-          if (client.readyState !== 1) {
-            controller.error("WebSocket closed");
-            return;
-          }
-          if (header) {
-            client.send(await new Blob([header, chunk]).arrayBuffer());
-            header = null;
-          } else {
-            client.send(chunk);
-          }
-        },
-        close() {
-          safeCloseWebSocket(client);
-        },
-        abort() {
-          safeCloseWebSocket(client);
-        }
-      })
-    )
-    .catch(() => {
-      safeCloseWebSocket(client);
-      if (!hasIncomingData && retry) retry();
+    const resp = await fetch("https://1.1.1.1/dns-query", {
+      method: "POST",
+      headers: { "content-type": "application/dns-message" },
+      body: dnsQuery,
     });
-}
 
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
-  return new ReadableStream({
-    start(controller) {
-      webSocketServer.addEventListener("message", (event) => controller.enqueue(event.data));
-      webSocketServer.addEventListener("close", () => {
-        safeCloseWebSocket(webSocketServer);
-        controller.close();
-      });
-      webSocketServer.addEventListener("error", (err) => controller.error(err));
-
-      const { earlyData, error } = base64ToArrayBuffer(earlyDataHeader);
-      if (error) controller.error(error);
-      else if (earlyData) controller.enqueue(earlyData);
-    },
-    cancel() {
-      safeCloseWebSocket(webSocketServer);
+    if (resp.ok) {
+      const dnsResponse = new Uint8Array(await resp.arrayBuffer());
+      const responsePacket = new Uint8Array(2 + dnsResponse.length);
+      responsePacket[0] = (dnsResponse.length >> 8) & 0xff;
+      responsePacket[1] = dnsResponse.length & 0xff;
+      responsePacket.set(dnsResponse, 2);
+      if (client.readyState === 1) client.send(responsePacket);
     }
-  });
+  }
+
+  if (parsed.payload && parsed.payload.length > 0) {
+    await processDnsPacket(parsed.payload);
+  }
+
+  return {
+    write: processDnsPacket,
+    close: () => closeClient(client)
+  };
 }
 
-// ------------------------------------------------------------------------------
-// Pure VLESS WebSocket Stream Handler
-// ------------------------------------------------------------------------------
-async function handleVlessWS(request, allowedUUIDList, proxyIP, githubProxyURL) {
-  const webSocketPair = new WebSocketPair();
-  const [client, webSocketServer] = Object.values(webSocketPair);
-  webSocketServer.accept();
+function makeSocketReadable(socket, client, responseHeader) {
+  let header = responseHeader;
+  return socket.readable.pipeTo(new WritableStream({
+    write(chunk) {
+      if (client.readyState !== 1) throw new Error("WebSocket is closed");
+      const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      if (header) {
+        const output = new Uint8Array(header.length + bytes.length);
+        output.set(header);
+        output.set(bytes, header.length);
+        client.send(output);
+        header = null;
+      } else {
+        client.send(bytes);
+      }
+    }
+  })).catch(() => closeClient(client));
+}
 
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol");
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocketServer, earlyDataHeader);
+async function startTcpTunnel(client, parsed, config) {
+  let socket;
+  try {
+    socket = connect({ hostname: parsed.host, port: parsed.port });
+    await socket.opened;
+  } catch {
+    const proxy = await getProxyIP(config);
+    const [proxyHost, proxyPort] = proxy.split(":");
+    socket = connect({ hostname: proxyHost, port: Number(proxyPort) || parsed.port });
+  }
 
-  let remoteSocket = { value: null };
-  let udpWriter = null;
+  socket.closed.catch(() => closeClient(client)).finally(() => closeClient(client));
+  const writer = socket.writable.getWriter();
+  await writer.write(parsed.payload);
+  writer.releaseLock();
 
-  readableWebSocketStream
-    .pipeTo(
-      new WritableStream({
-        async write(chunk, controller) {
-          if (udpWriter) {
-            udpWriter.write(chunk);
-            return;
-          }
+  makeSocketReadable(socket, client, parsed.responseHeader);
+  return socket;
+}
 
-          if (remoteSocket.value) {
-            const writer = remoteSocket.value.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
-            return;
-          }
+function openWebSocket(request, config) {
+  const pair = new WebSocketPair();
+  const client = pair[0];
+  const server = pair[1];
+  server.accept();
 
-          if (chunk.byteLength < 18) {
-            controller.error("Invalid VLESS packet length");
-            return;
-          }
+  let socket = null;
+  let udpHandler = null;
+  let buffer = new Uint8Array(0);
+  let connected = false;
+  const earlyData = base64ToBytes(request.headers.get("Sec-WebSocket-Protocol"));
 
-          // 1. Verify VLESS UUID
-          const clientUUIDBytes = new Uint8Array(chunk.slice(1, 17));
-          let isAuthorized = false;
+  const consume = async (chunk) => {
+    const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : new Uint8Array(chunk);
+    
+    if (connected) {
+      if (udpHandler) {
+        await udpHandler.write(bytes);
+      } else if (socket) {
+        const writer = socket.writable.getWriter();
+        try { await writer.write(bytes); } finally { writer.releaseLock(); }
+      }
+      return;
+    }
 
-          for (const validUUID of allowedUUIDList) {
-            if (compareBytes(clientUUIDBytes, stringToUUIDBytes(validUUID))) {
-              isAuthorized = true;
-              break;
-            }
-          }
+    const combined = new Uint8Array(buffer.length + bytes.length);
+    combined.set(buffer);
+    combined.set(bytes, buffer.length);
+    buffer = combined;
 
-          if (!isAuthorized) {
-            controller.error("Unauthorized VLESS UUID");
-            return;
-          }
+    const parsed = readVlessHeader(buffer, config.uuid);
+    if (!parsed) return;
+    if (isBlockedDestination(parsed.host)) throw new Error("Blocked destination");
+    
+    connected = true;
 
-          // 2. Parse VLESS Protocol Fields
-          const optLen = new Uint8Array(chunk.slice(17, 18))[0];
-          let cursor = 18 + optLen;
+    if (parsed.command === 2) {
+      udpHandler = await handleUdpDns(server, parsed);
+    } else {
+      socket = await startTcpTunnel(server, parsed, config);
+    }
+  };
 
-          const command = new Uint8Array(chunk.slice(cursor, cursor + 1))[0];
-          cursor += 1;
-
-          const portRemote = new DataView(chunk.slice(cursor, cursor + 2)).getUint16(0);
-          cursor += 2;
-
-          const addressType = new Uint8Array(chunk.slice(cursor, cursor + 1))[0];
-          cursor += 1;
-
-          let addressRemote = "";
-          if (addressType === 1) {
-            // IPv4
-            addressRemote = new Uint8Array(chunk.slice(cursor, cursor + 4)).join(".");
-            cursor += 4;
-          } else if (addressType === 2) {
-            // Domain
-            const domainLength = new Uint8Array(chunk.slice(cursor, cursor + 1))[0];
-            cursor += 1;
-            addressRemote = new TextDecoder().decode(chunk.slice(cursor, cursor + domainLength));
-            cursor += domainLength;
-          } else if (addressType === 3) {
-            // IPv6
-            const ipv6View = new DataView(chunk.slice(cursor, cursor + 16));
-            const parts = [];
-            for (let i = 0; i < 8; i++) parts.push(ipv6View.getUint16(i * 2).toString(16));
-            addressRemote = parts.join(":");
-            cursor += 16;
-          }
-
-          const rawClientData = chunk.slice(cursor);
-          const vlessResponseHeader = new Uint8Array([chunk[0], 0]);
-
-          if (command === 1) {
-            // TCP Outbound (Normal Internet Traffic)
-            handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, client, vlessResponseHeader, proxyIP, githubProxyURL);
-          } else if (command === 2) {
-            // UDP DNS Outbound (Port 53 via Multi-DoH)
-            udpWriter = await handleUDPOutBound(webSocketServer, vlessResponseHeader, client);
-            udpWriter.write(rawClientData);
-          } else {
-            controller.error(`Unsupported command: ${command}`);
-          }
-        },
-        close() {
-          safeCloseWebSocket(webSocketServer);
-        },
-        abort() {
-          safeCloseWebSocket(webSocketServer);
-        }
-      })
-    )
-    .catch(() => safeCloseWebSocket(webSocketServer));
+  server.addEventListener("message", (event) => consume(event.data).catch(() => closeClient(server)));
+  server.addEventListener("close", () => { closeSocket(socket); udpHandler?.close(); });
+  server.addEventListener("error", () => { closeSocket(socket); udpHandler?.close(); });
+  
+  if (earlyData) consume(earlyData).catch(() => closeClient(server));
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-// ------------------------------------------------------------------------------
-// Subscription Generator (Pure VLESS Links)
-// ------------------------------------------------------------------------------
-function makeVlessLinks(request, uuid) {
-  const url = new URL(request.url);
-  const host = url.host;
-  const cleanIpParam = url.searchParams.get("cleanip") || "";
-  const address = cleanIpParam.trim() || host;
-
-  const path = encodeURIComponent("/?ed=2048");
-
-  // 1. Port 80 (No-TLS) - Best for Speed / DPI Bypass
-  const vless80 = `vless://${uuid}@${address}:80?encryption=none&security=none&type=ws&host=${host}&path=${path}#${encodeURIComponent(`[VLESS-NoTLS:80] ${host}`)}`;
-
-  // 2. Port 8080 (Alternative HTTP) - MPT / Atom Best Compatibility
-  const vless8080 = `vless://${uuid}@${address}:8080?encryption=none&security=none&type=ws&host=${host}&path=${path}#${encodeURIComponent(`[VLESS-NoTLS:8080] ${host}`)}`;
-
-  // 3. Port 443 (TLS 1.3) - Standard Encrypted Node
-  const vless443 = `vless://${uuid}@${address}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${path}#${encodeURIComponent(`[VLESS-TLS:443] ${host}`)}`;
-
-  // 4. Port 8443 (Alternative TLS)
-  const vless8443 = `vless://${uuid}@${address}:8443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${path}#${encodeURIComponent(`[VLESS-TLS:8443] ${host}`)}`;
-
-  const allLinks = [vless80, vless8080, vless443, vless8443];
-  const base64Sub = btoa(allLinks.join("\n"));
-
-  return { vless80, vless8080, vless443, vless8443, allLinks, base64Sub };
+function encodeBase64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
 }
 
-// ------------------------------------------------------------------------------
-// Camouflage Webpage
-// ------------------------------------------------------------------------------
-function getMaskPage(host, clientIp, colo) {
+function makeLinks(request, config) {
+  const url = new URL(request.url);
+  const host = url.host;
+  const path = encodeURIComponent(`${config.path}?ed=2048`);
+
+  const nodes = [
+    { name: `VLESS TLS (${host})`, address: host, port: 443, tls: true },
+    { name: `VLESS Clean (icook.hk)`, address: "icook.hk", port: 443, tls: true },
+    { name: `VLESS Clean (Visa)`, address: "www.visasoutheasteurope.com", port: 443, tls: true },
+    { name: `VLESS Clean (cdn.eu.org)`, address: "cdn.xn--b6gac.eu.org", port: 443, tls: true },
+    { name: `VLESS NoTLS (${host})`, address: host, port: 80, tls: false }
+  ];
+
+  const links = nodes.map(n => {
+    const sec = n.tls ? "security=tls&sni=" + host : "security=none";
+    return `vless://${config.uuid}@${n.address}:${n.port}?encryption=none&${sec}&type=ws&host=${host}&path=${path}#${encodeURIComponent(n.name)}`;
+  }).join("\n");
+
+  return { base64: encodeBase64(links) };
+}
+
+// ============================================
+// ELEGANT CAMOUFLAGE MASK PAGE (Edge Diagnostics)
+// ============================================
+export function getMaskPage(host = "localhost", isUuidConfigured = true, clientIp = "127.0.0.1", colo = "EDGE-GLOBAL") {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge Network Gateway</title>
+  <title>Edge Gateway | Cloud Diagnostics &amp; Latency Monitor</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0a0e17; color: #f1f5f9; min-height: 100vh; display: flex; flex-direction: column; }
-    header { background: #0f172a; border-bottom: 1px solid #1e293b; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
-    .status { color: #10b981; font-size: 13px; font-weight: 600; }
-    main { max-width: 600px; margin: 40px auto; padding: 0 20px; flex: 1; }
-    .card { background: #0f172a; border: 1px solid #1e293b; border-radius: 12px; padding: 24px; }
-    h1 { font-size: 18px; margin-bottom: 8px; color: #38bdf8; }
-    p { font-size: 13px; color: #94a3b8; line-height: 1.6; }
-    .row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #1e293b; font-size: 13px; }
-    .lbl { color: #64748b; }
-    .val { font-family: monospace; color: #e2e8f0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+      padding: 14px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+    .logo-area {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 800;
+      font-size: 16px;
+      color: #0f172a;
+    }
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: #0f172a;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #ffffff;
+      font-weight: 900;
+      font-size: 15px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: ${isUuidConfigured ? '#0f172a' : '#991b1b'};
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 11px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: ${isUuidConfigured ? '#22c55e' : '#fca5a5'};
+      box-shadow: 0 0 8px ${isUuidConfigured ? '#22c55e' : '#f87171'};
+    }
+    main {
+      flex: 1;
+      max-width: 920px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 32px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .hero-card {
+      background: linear-gradient(180deg, #f0fdf4 0%, #ffffff 40%);
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      padding: 28px 24px;
+      box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.03);
+      position: relative;
+    }
+    .hero-top-badge {
+      position: absolute;
+      top: 24px;
+      right: 24px;
+      background: #dcfce7;
+      border: 1px solid #bbf7d0;
+      color: #166534;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 12px;
+      border-radius: 9999px;
+    }
+    .hero-title {
+      font-size: 22px;
+      font-weight: 800;
+      color: #0f172a;
+      margin-bottom: 8px;
+    }
+    .hero-desc {
+      color: #475569;
+      font-size: 14px;
+      line-height: 1.6;
+      max-width: 680px;
+      margin-bottom: 20px;
+    }
+    .btn-run {
+      background: #0f172a;
+      color: #ffffff;
+      border: none;
+      padding: 9px 18px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .bench-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .bench-box {
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+    .bench-box-1 { background: #ecfdf5; border: 1px solid #a7f3d0; }
+    .bench-box-2 { background: #f0fdf4; border: 1px solid #bbf7d0; }
+    .bench-box-3 { background: #eef2ff; border: 1px solid #c7d2fe; }
+    .bench-box-4 { background: #faf5ff; border: 1px solid #e9d5ff; }
+    .bench-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: #475569;
+    }
+    .bench-val {
+      font-size: 24px;
+      font-weight: 800;
+      color: #0f172a;
+      margin-top: 4px;
+      font-family: monospace;
+    }
+    .bench-meta {
+      font-size: 12px;
+      font-weight: 600;
+      margin-top: 2px;
+      color: #16a34a;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    @media (min-width: 768px) {
+      .grid-2 { grid-template-columns: 1fr 1fr; }
+    }
+    .card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);
+    }
+    .card-heading {
+      font-size: 14px;
+      font-weight: 800;
+      color: #0f172a;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 9px 0;
+      border-bottom: 1px solid #f1f5f9;
+      font-size: 13px;
+    }
+    .info-row:last-child { border-bottom: none; }
+    .info-k { color: #64748b; font-weight: 500; }
+    .info-v { color: #0f172a; font-family: monospace; font-weight: 700; }
+    footer {
+      background: #ffffff;
+      border-top: 1px solid #e2e8f0;
+      padding: 16px;
+      text-align: center;
+      font-size: 12px;
+      color: #64748b;
+    }
   </style>
 </head>
 <body>
   <header>
-    <div style="font-weight: 700; color: #38bdf8;">Cloudflare Anycast Gateway</div>
-    <div class="status">● Active</div>
+    <div class="logo-area">
+      <div class="logo-icon">⚡</div>
+      <span>EdgeTunnel Cloud</span>
+    </div>
+    <div class="status-pill">
+      <span class="status-dot"></span>
+      <span>${isUuidConfigured ? 'EDGE OPERATIONAL' : 'CONFIGURATION REQUIRED'}</span>
+    </div>
   </header>
+
   <main>
-    <div class="card">
-      <h1>VLESS Relay Gateway Online</h1>
-      <p>WebSocket Anycast Ingress Node.</p>
-      <div style="margin-top: 20px;">
-        <div class="row"><span class="lbl">Host</span><span class="val">${host}</span></div>
-        <div class="row"><span class="lbl">Client IP</span><span class="val">${clientIp}</span></div>
-        <div class="row"><span class="lbl">POP Location</span><span class="val">${colo}</span></div>
-        <div class="row"><span class="lbl">HTTP Ports</span><span class="val">80, 8080, 8880</span></div>
-        <div class="row"><span class="lbl">HTTPS Ports</span><span class="val">443, 8443</span></div>
+    <div class="hero-card">
+      <div class="hero-top-badge">${isUuidConfigured ? 'Ready' : 'Standby'}</div>
+      <h1 class="hero-title">Edge Network Diagnostics &amp; Telemetry</h1>
+      <p class="hero-desc">Real-time edge server telemetry, DNS-over-HTTPS status verification, and full-duplex socket connectivity diagnostics for cloud edge clusters.</p>
+      
+      <button class="btn-run" id="btnBench" onclick="runDiagnostics()">
+        ⚡ Re-Run Benchmark
+      </button>
+
+      <div class="bench-grid">
+        <div class="bench-box bench-box-1">
+          <div class="bench-label">Roundtrip Ping</div>
+          <div class="bench-val" id="pingVal">-- ms</div>
+          <div class="bench-meta" id="pingStatus">Measuring...</div>
+        </div>
+        <div class="bench-box bench-box-2">
+          <div class="bench-label">DNS-Over-HTTPS</div>
+          <div class="bench-val">Active</div>
+          <div class="bench-meta">Cloudflare 1.1.1.1</div>
+        </div>
+        <div class="bench-box bench-box-3">
+          <div class="bench-label">WebSocket Engine</div>
+          <div class="bench-val">Optimized</div>
+          <div class="bench-meta">RFC 6455 Fast WS</div>
+        </div>
+        <div class="bench-box bench-box-4">
+          <div class="bench-label">Edge Cluster Location</div>
+          <div class="bench-val">${colo}</div>
+          <div class="bench-meta">Anycast Network</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-heading">🌐 Connection Telemetry</div>
+        <div class="info-row">
+          <span class="info-k">Client Remote IP:</span>
+          <span class="info-v">${clientIp}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-k">Serving Host (SNI):</span>
+          <span class="info-v">${host}</span>
+        </div>
+        <div class="info-row">
+          <span class="info-k">HTTP Protocol:</span>
+          <span class="info-v">HTTP/2 &amp; HTTP/3 (QUIC)</span>
+        </div>
+        <div class="info-row">
+          <span class="info-k">Encryption &amp; Cipher:</span>
+          <span class="info-v">TLS 1.3 / AEAD ChaCha20</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-heading">🛡️ Edge Security &amp; Health</div>
+        <div class="info-row">
+          <span class="info-k">Security Layer:</span>
+          <span class="info-v" style="color: #16a34a;">Active</span>
+        </div>
+        <div class="info-row">
+          <span class="info-k">Global Edge Cache:</span>
+          <span class="info-v">100% Operational</span>
+        </div>
+        <div class="info-row">
+          <span class="info-k">Service Status:</span>
+          <span class="info-v" style="color: #16a34a;">Optimal (99.99%)</span>
+        </div>
       </div>
     </div>
   </main>
+
+  <footer>
+    EdgeTunnel Cloud Network • High Availability Edge Gateway • All Systems Running
+  </footer>
+
+  <script>
+    async function runDiagnostics() {
+      const btn = document.getElementById('btnBench');
+      const pingVal = document.getElementById('pingVal');
+      const pingStatus = document.getElementById('pingStatus');
+
+      btn.disabled = true;
+      btn.textContent = "Testing...";
+      pingVal.textContent = "...";
+
+      const pings = [];
+      for (let i = 0; i < 3; i++) {
+        const start = performance.now();
+        try {
+          await fetch('/healthz?t=' + Date.now(), { cache: 'no-store' });
+          pings.push(Math.round(performance.now() - start));
+        } catch (e) {
+          pings.push(24);
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      const avg = Math.round(pings.reduce((a, b) => a + b, 0) / pings.length);
+      pingVal.textContent = avg + ' ms';
+      pingStatus.textContent = "Optimal Latency";
+      btn.disabled = false;
+      btn.textContent = "⚡ Re-Run Benchmark";
+    }
+
+    setTimeout(runDiagnostics, 400);
+  </script>
 </body>
 </html>`;
 }
 
-// ------------------------------------------------------------------------------
-// Main Fetch Handler
-// ------------------------------------------------------------------------------
-export default {
-  async fetch(request, env = {}) {
-    const url = new URL(request.url);
+// ================= Unified Handler =================
+async function handleRequest(request, env, ctx) {
+  const config = getConfig(env);
+  const url = new URL(request.url);
+  const upgrade = request.headers.get("Upgrade");
 
-    // 1. Config
-    const envUUID = (env.UUID || "").trim().toLowerCase();
-    const proxyIP = (env.PROXYIP || "").trim() || DEFAULT_PROXY_IP;
-    const proxyURL = (env.PROXY_LIST_URL || "").trim() || DEFAULT_PROXY_URL;
-
-    const allowedUUIDList = envUUID
-      ? envUUID.includes(",")
-        ? envUUID.split(",").map((u) => u.trim().toLowerCase()).filter(isValidUUID)
-        : [envUUID]
-      : [DEFAULT_UUID];
-
-    const activeUUID = allowedUUIDList[0] || DEFAULT_UUID;
-
-    // 2. Pure VLESS WebSocket Relay
-    const upgradeHeader = request.headers.get("Upgrade");
-    if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
-      return await handleVlessWS(request, allowedUUIDList, proxyIP, proxyURL);
+  // 1. WebSocket VLESS Tunnel
+  if (upgrade && upgrade.toLowerCase() === "websocket") {
+    if (!config.isUuidValid) {
+      return new Response("Unauthorized: Missing or invalid UUID configuration", { status: 401 });
     }
-
-    // 3. Subscription Endpoint (/sub)
-    if (url.pathname === "/sub") {
-      const { allLinks, base64Sub } = makeVlessLinks(request, activeUUID);
-      const isPlain = url.searchParams.get("format") === "plain";
-      return new Response(isPlain ? allLinks.join("\n") : base64Sub, {
-        status: 200,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Access-Control-Allow-Origin": "*",
-          "Profile-Update-Interval": "24"
-        }
-      });
+    if (url.pathname !== config.path) {
+      return new Response("Not found", { status: 404 });
     }
+    return openWebSocket(request, config);
+  }
 
-    // 4. API Health Check
-    if (url.pathname === "/api/health" || url.pathname === "/api/ping") {
-      return new Response(
-        JSON.stringify({
-          status: "ok",
-          protocol: "vless",
-          ports: [80, 8080, 8880, 443, 8443],
-          colo: request.cf?.colo || "EDGE",
-          timestamp: Date.now()
-        }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json" }
-        }
-      );
+  // 2. Subscription Link (/sub)
+  if (url.pathname === "/sub") {
+    if (!config.isUuidValid) {
+      return new Response("UUID not set in environment", { status: 400 });
     }
-
-    // 5. Default: Camouflage Webpage
-    const host = request.headers.get("Host") || url.host;
-    const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
-    const colo = request.cf?.colo || "EDGE-ANYCAST";
-
-    return new Response(getMaskPage(host, clientIp, colo), {
-      status: 200,
+    const links = makeLinks(request, config);
+    return new Response(links.base64, {
       headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "public, max-age=3600"
+        "content-type": "text/plain; charset=utf-8",
+        "access-control-allow-origin": "*",
+        "profile-update-interval": "12"
       }
     });
   }
+
+  // 3. Health Check
+  if (url.pathname === "/healthz") {
+    return new Response("ok", { 
+      headers: { 
+        "cache-control": "no-store", 
+        "content-type": "text/plain" 
+      } 
+    });
+  }
+
+  // 4. Default: Camouflage Mask Page
+  const clientIp = request.headers.get("CF-Connecting-IP") || "127.0.0.1";
+  const colo = (request.cf && request.cf.colo) ? request.cf.colo : "EDGE-ANYCAST";
+  const html = getMaskPage(url.host, config.isUuidValid, clientIp, colo);
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store, max-age=0"
+    }
+  });
+}
+
+// Export 1: Standard Cloudflare Worker export
+const worker = {
+  fetch: handleRequest
 };
+export default worker;
+
+// Export 2: Cloudflare Pages Functions export (Single-file Pages compatibility)
+export async function onRequest(context) {
+  return handleRequest(context.request, context.env, context);
+}
+export const onRequestGet = onRequest;
+export const onRequestPost = onRequest;
