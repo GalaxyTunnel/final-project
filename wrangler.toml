@@ -1,10 +1,15 @@
-name = "edgetunnel-vless"
-main = "_worker.js"
-compatibility_date = "2024-03-20"
-compatibility_flags = ["nodejs_compat"]
+name = "my-all-in-one-proxy"        # သင့် Worker နာမည် (ကြိုက်ရာပေးနိုင်သည်)
+main = "_worker.js"                  # သင့် worker code ဖိုင်နာမည် (ဥပမာ _worker.js သို့ src/index.js)
+compatibility_date = "2024-09-01"
 
+# ⚠️ အရေးကြီးဆုံး: TCP Sockets API သုံးနိုင်ရန် ဤ flag မဖြစ်မနေ ထည့်ရပါမည်
+compatibility_flags = [ "nodejs_compat" ]
+
+# 🌐 အလိုအလျောက် workers.dev domain ရရှိစေရန်
+workers_dev = true
+
+# 🔑 Variables များ (Plain text အနေဖြင့် ထည့်လိုပါက)
 [vars]
-#UUID = ""
-WS_PATH = "/vless"
-PROXY_URL = "https://galaxytunnel.github.io/PROXYIP.txt"
-PROXY_IP = "cdn.xn--b6gac.eu.org"
+#UUID = ""   # သင့် UUID ထည့်ပါ
+WS_PATH = "/"                                    # သင့် WS Path (ဥပမာ / သို့မဟုတ် /your-secret-path)
+PROXYIP = "cdn-b100.xn--b6gac.eu.org"            # စိတ်ကြိုက် Clean Proxy IP
